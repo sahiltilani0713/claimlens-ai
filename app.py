@@ -33,9 +33,9 @@ st.markdown(
         font-family: 'Inter', 'Segoe UI', sans-serif;
     }
 
-    /* ── Dark-blue page header / titles ── */
+    /* ── Page header / section titles ── */
     h1, h2, h3 {
-        color: #1e3a5f !important;
+        color: #93c5fd !important;
         font-weight: 700;
     }
 

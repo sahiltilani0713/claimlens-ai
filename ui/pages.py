@@ -17,9 +17,9 @@ from claimlens.services import CaseService
 def _rec_badge(rec: str) -> str:
     """Return an HTML-coloured badge for a recommendation string."""
     colours = {
-        "PROCEED": ("#22c55e", "#052e16"),          # green
-        "NEEDS_INFO": ("#f59e0b", "#1c1008"),        # amber
-        "ESCALATE": ("#ef4444", "#1f0707"),          # red
+        "PROCEED": ("#22c55e", "#052e16"),
+        "NEEDS_INFO": ("#f59e0b", "#1c1008"),
+        "ESCALATE": ("#ef4444", "#1f0707"),
     }
     bg, fg = colours.get(rec.upper(), ("#64748b", "#f8fafc"))
     return (
@@ -57,8 +57,6 @@ def render_upload(service: CaseService) -> None:
         for i, uf in enumerate(uploaded_files):
             try:
                 case_id = service.process_upload(uf.name, uf.read())
-                from claimlens.repository import CaseRepository
-                # Fetch the recommendation from the case just created
                 case = service.repo.get_case(case_id)
                 rec = case.decision.recommendation if (case and case.decision) else "—"
                 results.append({"Filename": uf.name, "Recommendation": rec})
@@ -68,8 +66,6 @@ def render_upload(service: CaseService) -> None:
 
         progress.empty()
         st.success(f"✅ Analyzed {len(results)} file(s).")
-
-        # Small summary table
         df = pd.DataFrame(results)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -86,7 +82,6 @@ def render_cases(service: CaseService) -> None:
     """
     st.subheader("📋 All Cases")
 
-    # ---- Fetch all cases for metrics ----
     try:
         all_cases = service.repo.list_cases()
     except Exception as exc:
@@ -107,7 +102,6 @@ def render_cases(service: CaseService) -> None:
         if c.decision and "PROCEED" in c.decision.recommendation.upper()
     )
 
-    # ---- Metric cards ----
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Cases", total)
     col2.metric("🔴 Escalate", escalate_count)
@@ -116,7 +110,6 @@ def render_cases(service: CaseService) -> None:
 
     st.divider()
 
-    # ---- Filters ----
     f1, f2, f3 = st.columns([3, 2, 2])
     with f1:
         search = st.text_input("🔎 Search (filename or applicant)", key="cases_search")
@@ -127,7 +120,6 @@ def render_cases(service: CaseService) -> None:
         rec_opts = ["", "PROCEED", "NEEDS_INFO", "ESCALATE"]
         rec_filter = st.selectbox("Recommendation", rec_opts, key="cases_rec")
 
-    # ---- Filtered fetch ----
     try:
         cases = service.repo.list_cases(
             search=search,
@@ -142,7 +134,6 @@ def render_cases(service: CaseService) -> None:
         st.info("No cases match your filters.")
         return
 
-    # ---- Build table rows ----
     rows = []
     for c in cases:
         rec = c.decision.recommendation if c.decision else "—"
@@ -157,8 +148,8 @@ def render_cases(service: CaseService) -> None:
 
     df = pd.DataFrame(rows)
 
-    # Colour-code Recommendation column via Styler
     def colour_rec(val: str) -> str:
+        """Return CSS for colour-coded recommendation."""
         mapping = {
             "PROCEED": "color:#22c55e;font-weight:700",
             "NEEDS_INFO": "color:#f59e0b;font-weight:700",
@@ -169,7 +160,6 @@ def render_cases(service: CaseService) -> None:
     styled = df.style.map(colour_rec, subset=["Recommendation"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # ---- Open case selector ----
     st.divider()
     case_ids = [c.case_id for c in cases]
     chosen = st.selectbox(
@@ -188,10 +178,267 @@ def render_cases(service: CaseService) -> None:
 # ---------------------------------------------------------------------------
 
 def render_case_detail(service: CaseService) -> None:
-    """Render the Case Detail page (placeholder for now).
+    """Render the full Case Detail page.
+
+    Displays a case selector (synced with session_state), a coloured header
+    card with recommendation reasons, an extracted-fields table with confidence
+    and status colour badges, validation findings grouped by severity, a
+    field-correction st.form, a recommendation-override st.form (with an
+    empty-reason guard), and a newest-first audit trail table.
 
     Args:
         service: The shared CaseService instance.
     """
     st.subheader("🔍 Case Detail")
-    st.info("Coming next — full case breakdown, field editor, and audit log.")
+
+    # ------------------------------------------------------------------
+    # Case selector — allows picking a case directly on this page
+    # ------------------------------------------------------------------
+    try:
+        all_cases = service.repo.list_cases()
+    except Exception as exc:
+        st.error(f"Could not load cases: {exc}")
+        return
+
+    if not all_cases:
+        st.info("No cases found. Upload a document on the **Upload** page first.")
+        return
+
+    case_ids = [c.case_id for c in all_cases]
+    current_id = st.session_state.get("selected_case_id")
+    default_idx = case_ids.index(current_id) if current_id in case_ids else 0
+
+    chosen_id = st.selectbox(
+        "Select a case",
+        options=case_ids,
+        index=default_idx,
+        format_func=lambda cid: (
+            f"Case #{cid} — "
+            f"{next((c.filename for c in all_cases if c.case_id == cid), '')}"
+        ),
+        key="detail_case_select",
+    )
+    st.session_state["selected_case_id"] = chosen_id
+
+    if chosen_id is None:
+        st.info("👈 Pick a case on the **Cases** page or use the selector above.")
+        return
+
+    # ------------------------------------------------------------------
+    # Load the full case object
+    # ------------------------------------------------------------------
+    try:
+        case = service.repo.get_case(chosen_id)
+    except Exception as exc:
+        st.error(f"Could not load case #{chosen_id}: {exc}")
+        return
+
+    if case is None:
+        st.warning(f"Case #{chosen_id} was not found in the database.")
+        return
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 1. Header — filename, type, status + coloured recommendation card
+    # ------------------------------------------------------------------
+    rec = case.decision.recommendation if case.decision else "—"
+    reasons = case.decision.reasons if case.decision else []
+
+    rec_upper = rec.upper()
+    if "PROCEED" in rec_upper:
+        bg_col, border_col = "rgba(34,197,94,0.12)", "#22c55e"
+    elif "NEEDS" in rec_upper:
+        bg_col, border_col = "rgba(245,158,11,0.12)", "#f59e0b"
+    elif "ESCALATE" in rec_upper:
+        bg_col, border_col = "rgba(239,68,68,0.12)", "#ef4444"
+    else:
+        bg_col, border_col = "rgba(100,116,139,0.12)", "#64748b"
+
+    h_col, rec_col = st.columns([3, 2])
+    with h_col:
+        st.markdown(f"**📄 File:** `{case.filename}`")
+        st.markdown(f"**🗂 Type:** {case.doc_type}")
+        st.markdown(f"**🔖 Status:** `{case.status}`")
+        st.markdown(f"**🕒 Created:** {case.created_at}")
+
+    with rec_col:
+        reasons_html = (
+            "".join(f"<li>{r}</li>" for r in reasons)
+            if reasons
+            else "<li>No reasons recorded.</li>"
+        )
+        st.markdown(
+            f'<div style="background:{bg_col};border:2px solid {border_col};'
+            f'border-radius:12px;padding:16px 20px;">'
+            f'<div style="color:#f1f5f9;font-weight:700;font-size:1.1rem;margin-bottom:8px;">'
+            f"Recommendation: {rec}"
+            f'</div><ul style="margin:0;padding-left:18px;color:#f1f5f9;font-size:0.9rem;">'
+            f"{reasons_html}</ul></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 2. Extracted fields table
+    # ------------------------------------------------------------------
+    st.markdown("### 📊 Extracted Fields")
+    st.caption(
+        "Confidence is a heuristic based on how the value was found and its "
+        "format, not a statistical probability."
+    )
+
+    if case.fields:
+        field_rows = [
+            {
+                "Name":       ef.name,
+                "Value":      ef.value if ef.value is not None else "—",
+                "Confidence": ef.confidence,
+                "Status":     ef.status,
+            }
+            for ef in case.fields.values()
+        ]
+        fields_df = pd.DataFrame(field_rows)
+
+        def _conf_style(val: float) -> str:
+            """Green >=0.9, amber 0.4-0.89, red below 0.4."""
+            if val >= 0.9:
+                return "color:#16a34a;font-weight:700"
+            if val >= 0.4:
+                return "color:#d97706;font-weight:700"
+            return "color:#dc2626;font-weight:700"
+
+        def _status_style(val: str) -> str:
+            """Colour by field status."""
+            mapping = {
+                "verified":     "color:#16a34a;font-weight:700",
+                "needs_review": "color:#d97706;font-weight:700",
+                "missing":      "color:#dc2626;font-weight:700",
+            }
+            return mapping.get(val.lower(), "")
+
+        styled_fields = (
+            fields_df.style
+            .map(_conf_style, subset=["Confidence"])
+            .map(_status_style, subset=["Status"])
+            .format({"Confidence": "{:.0%}"})
+        )
+        st.dataframe(styled_fields, use_container_width=True, hide_index=True)
+    else:
+        st.info("No fields were extracted for this case.")
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 3. Validation findings grouped by severity
+    # ------------------------------------------------------------------
+    st.markdown("### ⚠️ Validation Findings")
+
+    findings = case.findings or []
+    if not findings:
+        st.success("No findings — all validation checks passed.")
+    else:
+        severity_groups = [
+            ("high",   "🔴 High",   "#fee2e2", "#7f1d1d"),
+            ("medium", "🟡 Medium", "#fef9c3", "#78350f"),
+            ("low",    "🔵 Low",    "#dbeafe", "#1e3a5f"),
+        ]
+        for sev_key, sev_label, sev_bg, sev_fg in severity_groups:
+            group = [f for f in findings if f.severity.lower() == sev_key]
+            if not group:
+                continue
+            st.markdown(
+                f'<div style="background:{sev_bg};border-radius:8px;'
+                f'padding:8px 16px;margin-bottom:4px;">'
+                f'<strong style="color:{sev_fg};">{sev_label}</strong></div>',
+                unsafe_allow_html=True,
+            )
+            for finding in group:
+                st.markdown(
+                    f'<div style="margin-left:16px;padding:3px 0;color:{sev_fg};">'
+                    f'• <code>{finding.code}</code> — {finding.message}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 4. Correct a field
+    # ------------------------------------------------------------------
+    st.markdown("### ✏️ Correct a Field")
+
+    field_names = list(case.fields.keys()) if case.fields else []
+    if not field_names:
+        st.info("No fields available to correct.")
+    else:
+        with st.form("correct_field_form", clear_on_submit=True):
+            selected_field = st.selectbox("Field to correct", options=field_names)
+            new_value = st.text_input("New value")
+            reviewer_name = st.text_input("Your name / reviewer ID")
+            submitted = st.form_submit_button("💾 Submit Correction", type="primary")
+
+        if submitted:
+            try:
+                service.correct_field(chosen_id, selected_field, new_value, reviewer_name)
+                st.success(f"✅ Field **{selected_field}** corrected. Analysis recomputed.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Correction failed: {exc}")
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 5. Override recommendation
+    # ------------------------------------------------------------------
+    st.markdown("### 🔄 Override Recommendation")
+
+    rec_options = ["PROCEED", "NEEDS_INFO", "ESCALATE"]
+    with st.form("override_form", clear_on_submit=True):
+        new_rec = st.selectbox("New recommendation", options=rec_options)
+        override_reason = st.text_area("Reason for override (required)")
+        override_reviewer = st.text_input(
+            "Your name / reviewer ID", key="override_reviewer_input"
+        )
+        override_submitted = st.form_submit_button("🔄 Submit Override", type="primary")
+
+    if override_submitted:
+        if not override_reason or not override_reason.strip():
+            st.error("❌ A reason is required before submitting an override.")
+        else:
+            try:
+                service.override_decision(
+                    chosen_id, new_rec, override_reason, override_reviewer
+                )
+                st.success(f"✅ Recommendation overridden to **{new_rec}**.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Override failed: {exc}")
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 6. Audit trail — newest first
+    # ------------------------------------------------------------------
+    st.markdown("### 📜 Audit Trail")
+
+    try:
+        audit_entries = service.repo.get_audit_log(chosen_id)
+    except Exception as exc:
+        st.error(f"Could not load audit log: {exc}")
+        audit_entries = []
+
+    if not audit_entries:
+        st.info("No audit entries yet for this case.")
+    else:
+        audit_rows = [
+            {
+                "Time (UTC)": entry.get("timestamp", ""),
+                "Actor":      entry.get("actor", ""),
+                "Action":     entry.get("action", ""),
+                "Details":    entry.get("details", ""),
+            }
+            for entry in audit_entries
+        ]
+        audit_df = pd.DataFrame(audit_rows)
+        st.dataframe(audit_df, use_container_width=True, hide_index=True)
