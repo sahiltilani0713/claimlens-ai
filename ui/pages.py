@@ -383,6 +383,8 @@ def render_case_detail(service: CaseService) -> None:
                 service.correct_field(chosen_id, selected_field, new_value, reviewer_name)
                 st.success(f"✅ Field **{selected_field}** corrected. Analysis recomputed.")
                 st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
             except Exception as exc:
                 st.error(f"Correction failed: {exc}")
 

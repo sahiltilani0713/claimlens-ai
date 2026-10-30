@@ -3,11 +3,12 @@ claimlens/services.py
 High-level service layer that orchestrates upload, analysis, correction, and override.
 """
 
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from claimlens.extraction import PDFExtractor
+from claimlens.extraction import PDFExtractor, parse_amount, parse_date
 from claimlens.models import Case
 from claimlens.repository import CaseRepository
 from claimlens.rules import DecisionEngine
@@ -96,38 +97,45 @@ class CaseService:
         """Correct one field, re-run analysis, and persist the updated decision.
 
         Steps:
-          1. Update the field value in the database.
-          2. Reload the full case.
-          3. Re-run Validator and DecisionEngine on all fields.
-          4. Save the new decision.
-          5. Set case status to "reviewed".
-          6. Add an "decision_recomputed" audit entry.
+          1. Validate format of the new value (raise ValueError if invalid).
+          2. Update the field value in the database.
+          3. Reload the full case.
+          4. Re-run Validator and DecisionEngine on all fields.
+          5. Save the new decision.
+          6. Set case status to "reviewed".
+          7. Add an "decision_recomputed" audit entry.
 
         Args:
             case_id:    Target case ID.
             field_name: Name of the field to correct (e.g. "monthly_income").
             new_value:  Corrected string value.
             reviewer:   Name/ID of the human reviewer.
+
+        Raises:
+            ValueError: If the field value fails format validation or case not found.
         """
-        # Step 1: persist the corrected field (also writes a field_corrected audit entry)
+        # Step 1: validate format before saving anything
+        self._validate_field(field_name, new_value)
+
+        # Step 2: persist the corrected field (also writes a field_corrected audit entry)
         self.repo.update_field(case_id, field_name, new_value, reviewer)
 
-        # Step 2: reload the updated case
+        # Step 3: reload the updated case
         case = self.repo.get_case(case_id)
         if case is None:
             raise ValueError(f"Case {case_id} not found.")
 
-        # Step 3: re-run validation and decision engine
+        # Step 4: re-run validation and decision engine
         val_findings = self._validator.validate(case.fields)
         new_decision = self._engine.decide(case.fields, val_findings)
 
-        # Step 4: replace findings and recommendation in the DB
+        # Step 5: replace findings and recommendation in the DB
         self.repo.save_decision(case_id, new_decision)
 
-        # Step 5: set status to "reviewed"
+        # Step 6: set status to "reviewed"
         self._set_status(case_id, "reviewed")
 
-        # Step 6: audit entry
+        # Step 7: audit entry
         self.repo.add_audit(
             case_id,
             reviewer,
@@ -174,3 +182,55 @@ class CaseService:
             conn.commit()
         finally:
             conn.close()
+
+    def _validate_field(self, field_name: str, value: str) -> None:
+        """Validate field value using format checks before persisting.
+
+        Rules:
+          - name: letters and spaces only
+          - IDs: letters, digits, and hyphens
+          - amounts: parseable by parse_amount and > 0
+          - dates: parseable by parse_date as DD-MM-YYYY
+
+        Raises:
+            ValueError: If the format check fails.
+        """
+        field_validators: dict[str, str] = {
+            "applicant_name": "name",
+            "application_id": "id",
+            "policy_number": "id",
+            "monthly_income": "amount",
+            "loan_amount": "amount",
+            "claim_amount": "amount",
+            "application_date": "date",
+            "loan_start_date": "date",
+            "loan_end_date": "date",
+            "policy_start_date": "date",
+            "incident_date": "date",
+        }
+        validator = field_validators.get(field_name)
+        if not validator:
+            return
+
+        val = value.strip() if value else ""
+
+        if validator == "name":
+            if not val or not re.match(r"^[A-Za-z\s]+$", val):
+                raise ValueError("Applicant name must contain only letters and spaces.")
+
+        elif validator == "id":
+            if not val or not re.match(r"^[A-Za-z0-9\-]+$", val):
+                label = "Application ID" if field_name == "application_id" else "Policy number"
+                raise ValueError(f"{label} must contain only letters, digits, and hyphens.")
+
+        elif validator == "amount":
+            amt = parse_amount(val) if val else None
+            if amt is None or amt <= 0:
+                label = field_name.replace("_", " ").capitalize()
+                raise ValueError(f"{label} must be a valid amount greater than 0.")
+
+        elif validator == "date":
+            if not val or not re.fullmatch(r"\d{2}-\d{2}-\d{4}", val) or parse_date(val) is None:
+                label = field_name.replace("_", " ").capitalize()
+                raise ValueError(f"{label} must be a valid date in DD-MM-YYYY format.")
+
